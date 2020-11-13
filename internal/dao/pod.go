@@ -65,9 +65,7 @@ func (p *Pod) Get(ctx context.Context, path string) (runtime.Object, error) {
 
 	var pmx *mv1beta1.PodMetrics
 	if withMx, ok := ctx.Value(internal.KeyWithMetrics).(bool); withMx || !ok {
-		if pmx, err = client.DialMetrics(p.Client()).FetchPodMetrics(ctx, path); err != nil {
-			log.Debug().Err(err).Msgf("No pod metrics")
-		}
+		pmx, _ = client.DialMetrics(p.Client()).FetchPodMetrics(ctx, path)
 	}
 
 	return &render.PodWithMetrics{Raw: u, MX: pmx}, nil
@@ -75,6 +73,15 @@ func (p *Pod) Get(ctx context.Context, path string) (runtime.Object, error) {
 
 // List returns a collection of nodes.
 func (p *Pod) List(ctx context.Context, ns string) ([]runtime.Object, error) {
+	oo, err := p.Resource.List(ctx, ns)
+	if err != nil {
+		return oo, err
+	}
+
+	var pmx client.PodsMetricsMap
+	if withMx, ok := ctx.Value(internal.KeyWithMetrics).(bool); withMx || !ok {
+		pmx, _ = client.DialMetrics(p.Client()).FetchPodsMetricsMap(ctx, ns)
+	}
 	sel, _ := ctx.Value(internal.KeyFields).(string)
 	fsel, err := labels.ConvertSelectorToLabelsMap(sel)
 	if err != nil {
@@ -82,26 +89,15 @@ func (p *Pod) List(ctx context.Context, ns string) ([]runtime.Object, error) {
 	}
 	nodeName := fsel["spec.nodeName"]
 
-	oo, err := p.Resource.List(ctx, ns)
-	if err != nil {
-		return oo, err
-	}
-
-	var pmx *mv1beta1.PodMetricsList
-	if withMx, ok := ctx.Value(internal.KeyWithMetrics).(bool); withMx || !ok {
-		if pmx, err = client.DialMetrics(p.Client()).FetchPodsMetrics(ctx, ns); err != nil {
-			log.Debug().Err(err).Msgf("No pods metrics")
-		}
-	}
-
 	res := make([]runtime.Object, 0, len(oo))
 	for _, o := range oo {
 		u, ok := o.(*unstructured.Unstructured)
 		if !ok {
 			return res, fmt.Errorf("expecting *unstructured.Unstructured but got `%T", o)
 		}
+		fqn := extractFQN(o)
 		if nodeName == "" {
-			res = append(res, &render.PodWithMetrics{Raw: u, MX: podMetricsFor(o, pmx)})
+			res = append(res, &render.PodWithMetrics{Raw: u, MX: pmx[fqn]})
 			continue
 		}
 
@@ -110,7 +106,7 @@ func (p *Pod) List(ctx context.Context, ns string) ([]runtime.Object, error) {
 			return res, fmt.Errorf("expecting interface map but got `%T", o)
 		}
 		if spec["nodeName"] == nodeName {
-			res = append(res, &render.PodWithMetrics{Raw: u, MX: podMetricsFor(o, pmx)})
+			res = append(res, &render.PodWithMetrics{Raw: u, MX: pmx[fqn]})
 		}
 	}
 
@@ -205,7 +201,6 @@ func (p *Pod) TailLogs(ctx context.Context, c LogChan, opts LogOptions) error {
 
 	var tailed bool
 	for _, co := range po.Spec.InitContainers {
-		log.Debug().Msgf("Tailing INIT-CO %q", co.Name)
 		opts.Container = co.Name
 		if err := tailLogs(ctx, p, c, opts); err != nil {
 			return err
@@ -213,7 +208,6 @@ func (p *Pod) TailLogs(ctx context.Context, c LogChan, opts LogOptions) error {
 		tailed = true
 	}
 	for _, co := range po.Spec.Containers {
-		log.Debug().Msgf("Tailing CO %q", co.Name)
 		opts.Container = co.Name
 		if err := tailLogs(ctx, p, c, opts); err != nil {
 			return err
@@ -221,7 +215,6 @@ func (p *Pod) TailLogs(ctx context.Context, c LogChan, opts LogOptions) error {
 		tailed = true
 	}
 	for _, co := range po.Spec.EphemeralContainers {
-		log.Debug().Msgf("Tailing EPH-CO %q", co.Name)
 		opts.Container = co.Name
 		if err := tailLogs(ctx, p, c, opts); err != nil {
 			return err
@@ -236,7 +229,7 @@ func (p *Pod) TailLogs(ctx context.Context, c LogChan, opts LogOptions) error {
 	return nil
 }
 
-// ScanSA scans for serviceaccount refs.
+// ScanSA scans for ServiceAccount refs.
 func (p *Pod) ScanSA(ctx context.Context, fqn string, wait bool) (Refs, error) {
 	ns, n := client.Namespaced(fqn)
 	oo, err := p.Factory.List(p.GVR(), ns, wait, labels.Everything())
@@ -334,12 +327,10 @@ func tailLogs(ctx context.Context, logger Logger, c LogChan, opts LogOptions) er
 	)
 done:
 	for r := 0; r < logRetryCount; r++ {
-		log.Debug().Msgf("Retry logs %d", r)
 		req, err = logger.Logs(opts.Path, opts.ToPodLogOptions())
 		if err == nil {
 			// This call will block if nothing is in the stream!!
 			if stream, err = req.Stream(ctx); err == nil {
-				log.Debug().Msgf("Reading logs")
 				go readLogs(stream, c, opts)
 				break
 			} else {
@@ -379,7 +370,7 @@ func readLogs(stream io.ReadCloser, c LogChan, opts LogOptions) {
 	for {
 		bytes, err := r.ReadBytes('\n')
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				log.Warn().Err(err).Msgf("Stream closed for %s", opts.Info())
 				c <- opts.DecorateLog([]byte("\nlog stream closed\n"))
 				return
@@ -390,19 +381,6 @@ func readLogs(stream io.ReadCloser, c LogChan, opts LogOptions) {
 		}
 		c <- opts.DecorateLog(bytes)
 	}
-}
-
-func podMetricsFor(o runtime.Object, mmx *mv1beta1.PodMetricsList) *mv1beta1.PodMetrics {
-	if mmx == nil {
-		return nil
-	}
-	fqn := extractFQN(o)
-	for _, mx := range mmx.Items {
-		if MetaFQN(mx.ObjectMeta) == fqn {
-			return &mx
-		}
-	}
-	return nil
 }
 
 // MetaFQN returns a fully qualified resource name.
@@ -426,18 +404,18 @@ func extractFQN(o runtime.Object) string {
 	u, ok := o.(*unstructured.Unstructured)
 	if !ok {
 		log.Error().Err(fmt.Errorf("expecting unstructured but got %T", o))
-		return "na"
+		return client.NA
 	}
 	m, ok := u.Object["metadata"].(map[string]interface{})
 	if !ok {
 		log.Error().Err(fmt.Errorf("expecting interface map for metadata but got %T", u.Object["metadata"]))
-		return "na"
+		return client.NA
 	}
 
 	n, ok := m["name"].(string)
 	if !ok {
 		log.Error().Err(fmt.Errorf("expecting interface map for name but got %T", m["name"]))
-		return "na"
+		return client.NA
 	}
 
 	ns, ok := m["namespace"].(string)
@@ -458,6 +436,7 @@ func in(ll []string, s string) bool {
 	return false
 }
 
+// GetPodSpec returns a pod spec given a resource.
 func (p *Pod) GetPodSpec(path string) (*v1.PodSpec, error) {
 	pod, err := p.GetInstance(path)
 	if err != nil {
@@ -467,6 +446,7 @@ func (p *Pod) GetPodSpec(path string) (*v1.PodSpec, error) {
 	return &podSpec, nil
 }
 
+// SetImages sets container images.
 func (p *Pod) SetImages(ctx context.Context, path string, imageSpecs ImageSpecs) error {
 	ns, n := client.Namespaced(path)
 	auth, err := p.Client().CanI(ns, "v1/pod", []string{client.PatchVerb})
@@ -476,10 +456,11 @@ func (p *Pod) SetImages(ctx context.Context, path string, imageSpecs ImageSpecs)
 	if !auth {
 		return fmt.Errorf("user is not authorized to patch a deployment")
 	}
-	if manager, isManaged, err := p.isControlled(path); isManaged {
-		if err != nil {
-			return err
-		}
+	manager, isManaged, err := p.isControlled(path)
+	if err != nil {
+		return err
+	}
+	if isManaged {
 		return fmt.Errorf("Unable to set image. This pod is managed by %s. Please set the image on the controller", manager)
 	}
 	jsonPatch, err := GetJsonPatch(imageSpecs)
@@ -506,7 +487,7 @@ func (p *Pod) isControlled(path string) (string, bool, error) {
 		return "", false, err
 	}
 	references := pod.GetObjectMeta().GetOwnerReferences()
-	if len(references) != 0 && *references[0].Controller == true {
+	if len(references) > 0 {
 		return fmt.Sprintf("%s/%s", references[0].Kind, references[0].Name), true, nil
 	}
 	return "", false, nil

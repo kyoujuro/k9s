@@ -235,6 +235,10 @@ func (s *Sanitizer) filter(root *xray.TreeNode) *xray.TreeNode {
 		return root.Filter(q, fuzzyFilter)
 	}
 
+	if ui.IsInverseSelector(q) {
+		return root.Filter(q, rxInverseFilter)
+	}
+
 	return root.Filter(q, rxFilter)
 }
 
@@ -315,7 +319,10 @@ func (s *Sanitizer) SetEnvFn(EnvFunc) {}
 func (s *Sanitizer) Refresh() {}
 
 // BufferChanged indicates the buffer was changed.
-func (s *Sanitizer) BufferChanged(q string) {
+func (s *Sanitizer) BufferChanged(q string) {}
+
+// BufferCompleted indicates input was accepted.
+func (s *Sanitizer) BufferCompleted(q string) {
 	s.update(s.filter(s.model.Peek()))
 }
 
@@ -360,8 +367,8 @@ func (s *Sanitizer) Stop() {
 	s.CmdBuff().RemoveListener(s)
 }
 
-// SetBindKeysFn sets up extra key bindings.
-func (s *Sanitizer) SetBindKeysFn(BindKeysFunc) {}
+// AddBindKeysFn sets up extra key bindings.
+func (s *Sanitizer) AddBindKeysFn(BindKeysFunc) {}
 
 // SetContextFn sets custom context.
 func (s *Sanitizer) SetContextFn(f ContextFunc) {
